@@ -1,55 +1,83 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <float.h>
 
-__global__ void naive_forward(const float* __restrict__ Q,
-                              const float* __restrict__ K,
-                              const float* __restrict__ V,
-                              float* __restrict__ O,
-                              int L, int d) {
-    int bnh = blockIdx.x;
-    int i   = threadIdx.x;
+__global__ void naive_attention_forward_kernel(const float* __restrict__ Q,
+                                               const float* __restrict__ K,
+                                               const float* __restrict__ V,
+                                               float*       __restrict__ O,
+                                               int B, int H, int S, int D) {
+    int b = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    float scale = rsqrtf(static_cast<float>(D));
 
-    const float* q = Q + bnh * L * d;
-    const float* k = K + bnh * L * d;
-    const float* v = V + bnh * L * d;
-    float*       o = O + bnh * L * d;
+    int head_stride  = S * D;
+    int batch_stride = H * head_stride;
+    int base = b * batch_stride + h * head_stride;
 
-    extern __shared__ float buf[];
+    for (int q = tid; q < S; q += blockDim.x) {
+        const float* q_ptr = Q + base + q * D;
 
-    if (i < L) {
-        // compute dot‑products against all keys
-        for (int j = 0; j < L; ++j) {
+        float max_logit = -FLT_MAX;
+        for (int k = 0; k < S; ++k) {
+            const float* k_ptr = K + base + k * D;
             float dot = 0.f;
-            for (int t = 0; t < d; ++t)
-                dot += q[i * d + t] * k[j * d + t];
-            buf[j] = dot / sqrtf((float)d);
+            for (int d = 0; d < D; ++d) dot += q_ptr[d] * k_ptr[d];
+            float scaled = dot * scale;
+            max_logit = fmaxf(max_logit, scaled);
         }
-        // softmax
-        float maxv = -FLT_MAX;
-        for (int j = 0; j < L; ++j) maxv = fmaxf(maxv, buf[j]);
-        float sum = 0.f;
-        for (int j = 0; j < L; ++j) sum += (buf[j] = __expf(buf[j] - maxv));
 
-        // weighted value sum
-        for (int t = 0; t < d; ++t) {
-            float acc = 0.f;
-            for (int j = 0; j < L; ++j)
-                acc += (buf[j] / sum) * v[j * d + t];
-            o[i * d + t] = acc;
+        float denom = 0.f;
+        float* o_ptr = O + base + q * D;
+        for (int d = 0; d < D; ++d) o_ptr[d] = 0.f;
+
+        for (int k = 0; k < S; ++k) {
+            const float* k_ptr = K + base + k * D;
+            float dot = 0.f;
+            for (int d = 0; d < D; ++d) dot += q_ptr[d] * k_ptr[d];
+            float e = __expf(dot * scale - max_logit);
+            denom += e;
+            const float* v_ptr = V + base + k * D;
+            for (int d = 0; d < D; ++d) o_ptr[d] += e * v_ptr[d];
         }
+
+        float inv_denom = 1.f / denom;
+        for (int d = 0; d < D; ++d) o_ptr[d] *= inv_denom;
     }
 }
 
-// Python binding
 torch::Tensor forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
-    const int B = q.size(0), H = q.size(1), L = q.size(2), d = q.size(3);
+    const int B = q.size(0);  // batch
+    const int H = q.size(1);  // heads 
+    const int S = q.size(2);  // sequence length
+    const int D = q.size(3);  // embedding dimension
+
     auto o = torch::empty_like(q);
-    const int block = 1;
-    naive_forward<<<B * H, block, L * sizeof(float)>>> (
-        q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
-        o.data_ptr<float>(), L, d);
-    return o;
+    
+    auto q_float = q.to(torch::kFloat32);
+    auto k_float = k.to(torch::kFloat32);
+    auto v_float = v.to(torch::kFloat32);
+    auto o_float = o.to(torch::kFloat32);
+    
+    const int threads = 128;
+    dim3 grid(B, H);
+
+    naive_attention_forward_kernel<<<grid, threads>>>(
+        q_float.data_ptr<float>(),
+        k_float.data_ptr<float>(),
+        v_float.data_ptr<float>(),
+        o_float.data_ptr<float>(),
+        B, H, S, D
+    );
+    
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(error));
+    }
+    
+    return o_float.to(q.dtype());
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
