@@ -16,13 +16,13 @@ setup(
             ],
             extra_compile_args={"nvcc": ["-O2", "--use_fast_math"]},
         ),
-        # CUDAExtension(
-        #     "flash._flash2",
-        #     [
-        #         str(this_dir / "flash/kernels/flash2.cu"),
-        #     ],
-        #     extra_compile_args={"nvcc": ["-O3", "--use_fast_math"]},
-        # ),
+        CUDAExtension(
+            "flash._flash2",
+            [
+                str(this_dir / "flash/kernels/flash2.cu"),
+            ],
+            extra_compile_args={"nvcc": ["-O3", "--use_fast_math"]},
+        ),
     ],
     cmdclass={"build_ext": BuildExtension.with_options(no_python_abi_suffix=True)},
 )
