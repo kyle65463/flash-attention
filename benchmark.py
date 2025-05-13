@@ -1,7 +1,10 @@
 import time
-import torch
+import json
+from collections import OrderedDict
+
 import numpy as np
-import pandas as pd
+import torch
+
 from baseline import (
     pytorch_attn_efficient,
     pytorch_attn_flash,
@@ -9,193 +12,162 @@ from baseline import (
     pytorch_manual_attn,
     flashattn_lib_attn,
 )
-from collections import OrderedDict
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+BYTES_PER_EL = {torch.float16: 2, torch.bfloat16: 2, torch.float32: 4, torch.float64: 8}
+
+def attn_ops_and_bytes(b: int, h: int, s: int, d: int, dtype):
+    """Rough FLOP / byte model for standard scaled‑dot attention."""
+    flops = 4 * b * h * s * s * d         # QKᵀ + softmax + AV (≈4 matmuls)
+    bytes_mv = 4 * b * h * s * d * BYTES_PER_EL[dtype]  # read Q,K,V, write O
+    return flops, bytes_mv
 
 
-def run_timed(func, *args, runs=5):
-    """Run a function multiple times and return the output and mean execution time."""
-    times = []
-    output = None
+def run_timed(func, *args, runs: int = 5):
+    """Return output, mean latency (ms) and mean peak memory (MB) over *runs*."""
+    times, mems, output = [], [], None
 
-    # Warmup
-    _ = func(*args)
-
-    # Run the function multiple times
+    func(*args)  # warm‑up
     for _ in range(runs):
+        torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         output = func(*args)
         torch.cuda.synchronize()
-        times.append((time.perf_counter() - t0) * 1000)
-    mean = np.mean(times)
+        times.append((time.perf_counter() - t0) * 1e3)
+        mems.append(torch.cuda.max_memory_allocated() / (1024 ** 2))
+    return output, float(np.mean(times)), float(np.mean(mems))
 
-    return output, mean
-
+# -----------------------------------------------------------------------------
+# Benchmark core
+# -----------------------------------------------------------------------------
 
 def bench(
-    seq=32,
-    d=64,
-    heads=32,
-    batch=4,
-    device="cuda",
+    *,
+    seq: int,
+    d: int = 64,
+    heads: int = 32,
+    batch: int = 4,
+    device: str = "cuda",
     dtype=torch.float16,
-    configs=None,
-    reference_impl=None,
+    configs: dict,
+    reference_impl: str | None = None,
 ):
-    """Benchmark different attention implementations."""
-    print(
-        f"Running benchmark with sequence length: {seq}, dim: {d}, heads: {heads}, batch: {batch}"
-    )
+    qkv = [torch.randn(batch, heads, seq, d, device=device, dtype=dtype) for _ in range(3)]
+    flops_model, bytes_model = attn_ops_and_bytes(batch, heads, seq, d, dtype)
 
-    # Generate random query, key, value tensors
-    qkv = [
-        torch.randn(
-            batch,
-            heads,
-            seq,
-            d,
-            device=device,
-            dtype=dtype,
-            requires_grad=False,
-        )
-        for _ in range(3)
-    ]
+    ref_out = None
+    row = OrderedDict({"N_CTX": seq})
 
-    results = OrderedDict({"N_CTX": seq})
-    reference_output = None
-
-    # Run each enabled implementation
-    for name, config in configs.items():
-        if not config["enabled"]:
-            results[name] = "-"
+    for name, cfg in configs.items():
+        if not cfg["enabled"]:
+            for suf in ("time_ms", "mem_mb", "gflops", "ai", "tok_s"):
+                row[f"{name}_{suf}"] = "-"
             continue
-
-        impl_func = config["func"]
-        runs = config.get("runs", 5)
-
-        print(
-            f"Running {name} implementation{f' ({runs} runs)' if runs > 1 else ''}..."
-        )
-
         try:
-            # Time the implementation
-            output, mean_time = run_timed(impl_func, *qkv, runs=runs)
-            time_str = f"{mean_time:.3f}"
-
-            # Set reference output if this is the reference implementation
+            out, t_ms, m_mb = run_timed(cfg["func"], *qkv, runs=cfg.get("runs", 5))
             if name == reference_impl:
-                reference_output = output
+                ref_out = out
 
-            # Compare with reference if available
-            if reference_output is not None and name != reference_impl:
-                if config.get("check_correctness", False) and not torch.allclose(
-                    output, reference_output, atol=1e-2
-                ):
-                    print(
-                        f"Warning: {name} and {reference_impl} implementations don't match exactly"
-                    )
-                    time_str = f"{time_str}*"
+            if ref_out is not None and name != reference_impl and cfg.get("check_correctness"):
+                if not torch.allclose(out, ref_out, atol=1e-2):
+                    t_ms = f"{t_ms:.3f}*"  # flag mismatch
 
-            results[name] = time_str
+            secs = float(t_ms) / 1e3 if isinstance(t_ms, (int, float)) else np.nan
+            gflops = flops_model / secs / 1e9 if secs else np.nan
+            ai = flops_model / bytes_model
+            tok_s = batch * seq / secs if secs else np.nan
 
+            row[f"{name}_time_ms"] = round(t_ms, 3) if isinstance(t_ms, (int, float)) else t_ms
+            row[f"{name}_mem_mb"] = round(m_mb, 2)
+            row[f"{name}_gflops"] = round(gflops, 2)
+            row[f"{name}_ai"] = round(ai, 2)
+            row[f"{name}_tok_s"] = round(tok_s, 1)
         except Exception as e:
-            print(f"Error running {name} implementation: {e}")
-            results[name] = "ERROR"
+            print(f"{name} failed: {e}")
+            for suf in ("time_ms", "mem_mb", "gflops", "ai", "tok_s"):
+                row[f"{name}_{suf}"] = "ERROR"
+    return row
 
-    return results
-
+# -----------------------------------------------------------------------------
+# Config discovery
+# -----------------------------------------------------------------------------
 
 def get_configs():
-    """Return default configurations for all implementations."""
-    configs = OrderedDict(
-        {
-            "PyTorch-Math": {
-                "enabled": torch.backends.cuda.is_built(),
-                "func": pytorch_attn_math,
-                "runs": 5,
-            },
-            "PyTorch-Flash": {
-                "enabled": hasattr(torch.backends.cuda, "flash_sdp_enabled")
-                and torch.backends.cuda.flash_sdp_enabled(),
-                "func": pytorch_attn_flash,
-                "runs": 5,
-            },
-            "PyTorch-Efficient": {
-                "enabled": hasattr(torch.backends.cuda, "mem_efficient_sdp_enabled")
-                and torch.backends.cuda.mem_efficient_sdp_enabled(),
-                "func": pytorch_attn_efficient,
-                "runs": 5,
-            },
-            "PyTorch-Manual": {
-                "enabled": True,
-                "func": pytorch_manual_attn,
-                "runs": 5,
-                "check_correctness": True,
-            },
-        }
-    )
+    cfgs = OrderedDict({
+        "PyTorch-Math": {
+            "enabled": torch.backends.cuda.is_built(),
+            "func": pytorch_attn_math,
+            "runs": 5,
+        },
+        "PyTorch-Flash": {
+            "enabled": getattr(torch.backends.cuda, "flash_sdp_enabled", lambda: False)(),
+            "func": pytorch_attn_flash,
+        },
+        "PyTorch-Efficient": {
+            "enabled": getattr(torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: False)(),
+            "func": pytorch_attn_efficient,
+        },
+        "PyTorch-Manual": {
+            "enabled": True,
+            "func": pytorch_manual_attn,
+            "check_correctness": True,
+        },
+    })
 
-    # Add flash-attn library implementation
     try:
-        import flash_attn
-
-        configs["FlashAttn-Lib"] = {
+        import flash_attn  # noqa: F401
+        cfgs["FlashAttn-Lib"] = {
             "enabled": True,
             "func": flashattn_lib_attn,
-            "runs": 5,
             "check_correctness": True,
         }
     except ImportError:
         print("flash-attn library not available")
 
-    # Add Flash implementations if available
     try:
-        import flash
-
-        configs["CUDA-Naive"] = {
+        import flash  # noqa: F401
+        cfgs["CUDA-Naive"] = {
             "enabled": True,
             "func": flash.naive_attn,
-            "runs": 5,
             "check_correctness": True,
         }
-
-        # Uncomment these when implemented
-        # configs["Flash2"] = {
-        #     "enabled": hasattr(flash, "flash2"),
-        #     "func": flash.flash2,
-        #     "runs": 5,
-        #     "check_correctness": True,
-        # }
+        if hasattr(flash, "flash2"):
+            cfgs["Flash2"] = {
+                "enabled": True,
+                "func": flash.flash2,
+                "check_correctness": True,
+            }
     except ImportError:
         print("Flash module not available")
 
-    return configs
+    return cfgs
 
+# -----------------------------------------------------------------------------
+# Entry
+# -----------------------------------------------------------------------------
 
-def format_results_table(results_list):
-    """Format benchmark results into a nice table."""
-    df = pd.DataFrame(results_list)
-    columns = {
-        f"| {col} |" if col == "N_CTX" else f" {col} [ms] |": df[col]
-        for col in df.columns
+def main():
+    seqs = [32, 128, 512, 1024, 2048, 4096]
+    cfgs = get_configs()
+
+    results = [bench(seq=s, configs=cfgs, reference_impl="PyTorch-Math") for s in seqs]
+
+    out = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "dtype": str(torch.float16),
+        "gpu_name": torch.cuda.get_device_name(0),
+        "cc": torch.cuda.get_device_capability(0),
+        "results": results,
     }
-    return pd.DataFrame(columns)
+
+    with open("benchmark_results.json", "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+    print("✔ benchmark_results.json saved")
 
 
 if __name__ == "__main__":
-    # Sequence lengths to test
-    seq_lengths = [32, 128, 512, 1024]
-
-    # Get default configurations
-    configs = get_configs()
-
-    results = []
-    for seq in seq_lengths:
-        result = bench(seq=seq, configs=configs, reference_impl="PyTorch-Math")
-        results.append(result)
-        print("\n" + "-" * 80 + "\n")
-
-    # Format and display results
-    formatted_df = format_results_table(results)
-    print("\nBenchmark Results Summary:")
-    print(formatted_df.to_string(index=False, justify="center"))
+    main()
