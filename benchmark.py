@@ -146,7 +146,7 @@ def get_configs():
 
 # ----- main --------------------------------------------------------------------
 def main():
-    seqs = [32, 128, 512, 1024, 2048]
+    seqs = [32, 128, 256, 512, 1024, 2048, 4096, 8192]
     cfgs = get_configs()
 
     results = [bench(seq=s, configs=cfgs, reference_impl="PyTorch-Math") for s in seqs]

@@ -17,6 +17,13 @@ setup(
             extra_compile_args={"nvcc": ["-O2", "--use_fast_math"]},
         ),
         CUDAExtension(
+            "flash._flash1",
+            [
+                str(this_dir / "flash/kernels/flash1.cu"),
+            ],
+            extra_compile_args={"nvcc": ["-O3", "--use_fast_math"]},
+        ),
+        CUDAExtension(
             "flash._flash2",
             [
                 str(this_dir / "flash/kernels/flash2.cu"),
