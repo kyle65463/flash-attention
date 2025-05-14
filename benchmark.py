@@ -1,10 +1,9 @@
-import time
 import json
+import time
 from collections import OrderedDict
 
 import numpy as np
 import torch
-
 from baseline import (
     pytorch_attn_efficient,
     pytorch_attn_flash,
@@ -12,160 +11,161 @@ from baseline import (
     pytorch_manual_attn,
     flashattn_lib_attn,
 )
+import flash
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-
+# ----- simple FLOP / byte model ------------------------------------------------
 BYTES_PER_EL = {torch.float16: 2, torch.bfloat16: 2, torch.float32: 4, torch.float64: 8}
 
-def attn_ops_and_bytes(b: int, h: int, s: int, d: int, dtype):
-    """Rough FLOP / byte model for standard scaled‑dot attention."""
-    flops = 4 * b * h * s * s * d         # QKᵀ + softmax + AV (≈4 matmuls)
-    bytes_mv = 4 * b * h * s * d * BYTES_PER_EL[dtype]  # read Q,K,V, write O
+
+def attn_ops_and_bytes(b, h, s, d, dtype):
+    flops = 4 * b * h * s * s * d  # QKᵀ + softmax + AV  (≈4 matmuls)
+    bytes_mv = 4 * b * h * s * d * BYTES_PER_EL[dtype]  # Q,K,V + O
     return flops, bytes_mv
 
 
-def run_timed(func, *args, runs: int = 5):
-    """Return output, mean latency (ms) and mean peak memory (MB) over *runs*."""
-    times, mems, output = [], [], None
+# ----- timing helper -----------------------------------------------------------
+def _run(func, *args, runs=5):
+    times, mems = [], []
+    out = func(*args)  # warm-up
 
-    func(*args)  # warm‑up
     for _ in range(runs):
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        output = func(*args)
+        out = func(*args)
         torch.cuda.synchronize()
         times.append((time.perf_counter() - t0) * 1e3)
-        mems.append(torch.cuda.max_memory_allocated() / (1024 ** 2))
-    return output, float(np.mean(times)), float(np.mean(mems))
+        mems.append(torch.cuda.max_memory_allocated() / 1024**2)
+    return out, float(np.mean(times)), float(np.mean(mems))
 
-# -----------------------------------------------------------------------------
-# Benchmark core
-# -----------------------------------------------------------------------------
 
+# ----- benchmark core ----------------------------------------------------------
 def bench(
     *,
-    seq: int,
-    d: int = 64,
-    heads: int = 32,
-    batch: int = 4,
-    device: str = "cuda",
+    seq,
+    d=64,
+    heads=32,
+    batch=4,
+    device="cuda",
     dtype=torch.float16,
-    configs: dict,
-    reference_impl: str | None = None,
+    configs,
+    reference_impl=None,
 ):
-    qkv = [torch.randn(batch, heads, seq, d, device=device, dtype=dtype) for _ in range(3)]
+    qkv = [
+        torch.randn(batch, heads, seq, d, device=device, dtype=dtype) for _ in range(3)
+    ]
     flops_model, bytes_model = attn_ops_and_bytes(batch, heads, seq, d, dtype)
+    reference = None
 
-    ref_out = None
-    row = OrderedDict({"N_CTX": seq})
+    result = {"seq": seq, "data": {}}
 
     for name, cfg in configs.items():
+        entry = {}
         if not cfg["enabled"]:
-            for suf in ("time_ms", "mem_mb", "gflops", "ai", "tok_s"):
-                row[f"{name}_{suf}"] = "-"
+            result["data"][name] = None  # disabled on this machine
             continue
+
         try:
-            out, t_ms, m_mb = run_timed(cfg["func"], *qkv, runs=cfg.get("runs", 5))
+            print(f"Running {name} with {seq} sequence length")
+            out, t_ms, m_mb = _run(cfg["func"], *qkv, runs=cfg.get("runs", 5))
             if name == reference_impl:
-                ref_out = out
+                reference = out
 
-            if ref_out is not None and name != reference_impl and cfg.get("check_correctness"):
-                if not torch.allclose(out, ref_out, atol=1e-2):
-                    t_ms = f"{t_ms:.3f}*"  # flag mismatch
+            if (
+                reference is not None
+                and name != reference_impl
+                and cfg.get("check_correctness")
+            ):
+                entry["mismatch"] = not torch.allclose(out, reference, atol=1e-2)
 
-            secs = float(t_ms) / 1e3 if isinstance(t_ms, (int, float)) else np.nan
-            gflops = flops_model / secs / 1e9 if secs else np.nan
-            ai = flops_model / bytes_model
-            tok_s = batch * seq / secs if secs else np.nan
-
-            row[f"{name}_time_ms"] = round(t_ms, 3) if isinstance(t_ms, (int, float)) else t_ms
-            row[f"{name}_mem_mb"] = round(m_mb, 2)
-            row[f"{name}_gflops"] = round(gflops, 2)
-            row[f"{name}_ai"] = round(ai, 2)
-            row[f"{name}_tok_s"] = round(tok_s, 1)
+            secs = t_ms / 1e3
+            entry.update(
+                time_ms=round(t_ms, 3),
+                mem_mb=round(m_mb, 2),
+                gflops=round(flops_model / secs / 1e9, 2),
+                ai=round(flops_model / bytes_model, 2),
+                tok_s=round(batch * seq / secs, 1),
+            )
         except Exception as e:
-            print(f"{name} failed: {e}")
-            for suf in ("time_ms", "mem_mb", "gflops", "ai", "tok_s"):
-                row[f"{name}_{suf}"] = "ERROR"
-    return row
+            entry["error"] = str(e)
 
-# -----------------------------------------------------------------------------
-# Config discovery
-# -----------------------------------------------------------------------------
+        result["data"][name] = entry
+    return result
 
+
+# ----- config discovery --------------------------------------------------------
 def get_configs():
-    cfgs = OrderedDict({
-        "PyTorch-Math": {
-            "enabled": torch.backends.cuda.is_built(),
-            "func": pytorch_attn_math,
-            "runs": 5,
-        },
-        "PyTorch-Flash": {
-            "enabled": getattr(torch.backends.cuda, "flash_sdp_enabled", lambda: False)(),
-            "func": pytorch_attn_flash,
-        },
-        "PyTorch-Efficient": {
-            "enabled": getattr(torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: False)(),
-            "func": pytorch_attn_efficient,
-        },
-        "PyTorch-Manual": {
-            "enabled": True,
-            "func": pytorch_manual_attn,
-            "check_correctness": True,
-        },
-    })
-
-    try:
-        import flash_attn  # noqa: F401
-        cfgs["FlashAttn-Lib"] = {
-            "enabled": True,
-            "func": flashattn_lib_attn,
-            "check_correctness": True,
-        }
-    except ImportError:
-        print("flash-attn library not available")
-
-    try:
-        import flash  # noqa: F401
-        cfgs["CUDA-Naive"] = {
-            "enabled": True,
-            "func": flash.naive_attn,
-            "check_correctness": True,
-        }
-        if hasattr(flash, "flash2"):
-            cfgs["Flash2"] = {
+    cfgs = OrderedDict(
+        {
+            "PyTorch-Math": {
+                "enabled": torch.backends.cuda.is_built(),
+                "func": pytorch_attn_math,
+            },
+            "PyTorch-Flash": {
+                "enabled": getattr(
+                    torch.backends.cuda, "flash_sdp_enabled", lambda: False
+                )(),
+                "func": pytorch_attn_flash,
+            },
+            "PyTorch-Efficient": {
+                "enabled": getattr(
+                    torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: False
+                )(),
+                "func": pytorch_attn_efficient,
+            },
+            "PyTorch-Manual": {
+                "enabled": True,
+                "func": pytorch_manual_attn,
+                "check_correctness": True,
+            },
+            "FlashAttn-Lib": {
+                "enabled": True,
+                "func": flashattn_lib_attn,
+                "check_correctness": True,
+            },
+            "Naive": {
+                "enabled": True,
+                "func": flash.naive_attn,
+                "check_correctness": True,
+            },
+            "Flash1": {
+                "enabled": True,
+                "func": flash.flash1,
+                "check_correctness": True,
+            },
+            "Flash2": {
                 "enabled": True,
                 "func": flash.flash2,
                 "check_correctness": True,
-            }
-    except ImportError:
-        print("Flash module not available")
+            },
+        }
+    )
 
     return cfgs
 
-# -----------------------------------------------------------------------------
-# Entry
-# -----------------------------------------------------------------------------
 
+# ----- main --------------------------------------------------------------------
 def main():
-    seqs = [32, 128, 512, 1024, 2048, 4096]
+    seqs = [32, 128, 512, 1024, 2048]
     cfgs = get_configs()
 
     results = [bench(seq=s, configs=cfgs, reference_impl="PyTorch-Math") for s in seqs]
 
-    out = {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "dtype": str(torch.float16),
-        "gpu_name": torch.cuda.get_device_name(0),
-        "cc": torch.cuda.get_device_capability(0),
+    payload = {
+        "meta": {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "dtype": str(torch.float16),
+            "gpu_name": torch.cuda.get_device_name(0),
+            "compute_capability": ".".join(
+                map(str, torch.cuda.get_device_capability(0))
+            ),
+        },
+        "configs": list(cfgs.keys()),
         "results": results,
     }
 
     with open("benchmark_results.json", "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2)
+        json.dump(payload, f, indent=2)
     print("✔ benchmark_results.json saved")
 
 

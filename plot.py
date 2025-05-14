@@ -1,42 +1,50 @@
-#!/usr/bin/env python3
-# plot_results.py
 import argparse
+from collections import defaultdict
 import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-# -------- tweakables ---------------------------------------------------------
-DISABLED  = {"PyTorch-Flash", "PyTorch-Efficient"}  # hide these kernels
-REF       = "PyTorch-Manual"                        # baseline for speed-up
-FIXED_LEN = 2048                                    # sequence length for B/D
-OUTDIR    = Path("./plots")                               # write PNGs here
-# -----------------------------------------------------------------------------
+# ─── Tweakables ────────────────────────────────────────────────────────────────
+DISABLED = {"PyTorch-Flash", "PyTorch-Efficient", "PyTorch-Math"}  # kernels to hide
+REF = "PyTorch-Manual"  # baseline for Plot B
+FIXED_LEN = 2048  # seq length for Plot B
+OUTDIR = Path("plots")  # output folder
+
+# GPU peak numbers for Roofline (edit to match your HW)
+PEAK_GFLOPS = 45_000  # e.g. 45 TFLOP/s FP16  ⇒ 45 000 GFLOP/s
+PEAK_BW_GB_S = 900  # e.g. 900 GB/s HBMe3   ⇒ mem-roof slope
+# ───────────────────────────────────────────────────────────────────────────────
 
 
-def load(path):
-    with open(path) as f:
+# ---------- helpers -----------------------------------------------------------
+def load_results(jpath):
+    with open(jpath) as f:
         js = json.load(f)
     return js["results"], js["configs"]
 
 
-# ---------- helpers to collect series ----------------------------------------
 def collect(results, cfgs, field):
+    """Return {kernel: ([seqs],[vals])}, skipping DISABLED + errors."""
     out = {c: ([], []) for c in cfgs if c not in DISABLED}
     for row in results:
         seq = row["seq"]
-        for c in out:
-            v = row["data"].get(c, {})
-            val = v.get(field)
+        for k in out:
+            entry = row["data"].get(k, {})
+            val = entry.get(field)
             if isinstance(val, (int, float)):
-                out[c][0].append(seq)
-                out[c][1].append(val)
+                out[k][0].append(seq)
+                out[k][1].append(val)
     return out
 
 
-# ---------- Plot A  -----------------------------------------------------------
-def plot_latency(results, cfgs):
+def get_row(results, seq):
+    return next((r["data"] for r in results if r["seq"] == seq), None)
+
+
+# ---------- Plot A ------------------------------------------------------------
+def plot_latency(results, cfgs, outdir):
     data = collect(results, cfgs, "time_ms")
     plt.figure(figsize=(6, 4))
     for k, (x, y) in data.items():
@@ -49,38 +57,12 @@ def plot_latency(results, cfgs):
     plt.title("Latency vs sequence length")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(OUTDIR / "latency.png")
+    plt.savefig(outdir / "A.latency.png", dpi=200)
     plt.close()
 
 
-# ---------- Plot B  -----------------------------------------------------------
-def plot_speedup(results, cfgs):
-    target = next((r["data"] for r in results if r["seq"] == FIXED_LEN), None)
-    if not target or not target.get(REF, {}).get("time_ms"):
-        print("speed-up plot skipped (missing baseline)")
-        return
-
-    lat_ref = target[REF]["time_ms"]
-    names, su = [], []
-    for c in cfgs:
-        if c in DISABLED or c == REF:
-            continue
-        lat = target.get(c, {}).get("time_ms")
-        if lat:
-            names.append(c)
-            su.append(lat_ref / lat)
-
-    plt.figure(figsize=(6, 3))
-    plt.bar(names, su)
-    plt.ylabel(f"Speed-up over {REF} @ {FIXED_LEN}")
-    plt.xticks(rotation=30, ha="right")
-    plt.tight_layout()
-    plt.savefig(OUTDIR / "speedup.png")
-    plt.close()
-
-
-# ---------- Plot C  -----------------------------------------------------------
-def plot_memory(results, cfgs):
+# ---------- Plot B ------------------------------------------------------------
+def plot_memory(results, cfgs, outdir):
     data = collect(results, cfgs, "mem_mb")
     plt.figure(figsize=(6, 4))
     for k, (x, y) in data.items():
@@ -93,48 +75,57 @@ def plot_memory(results, cfgs):
     plt.title("Memory vs sequence length")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(OUTDIR / "memory.png")
+    plt.savefig(outdir / "B.memory.png", dpi=200)
     plt.close()
 
 
-# ---------- Plot D  -----------------------------------------------------------
-def plot_roofline(results, cfgs):
-    row = next((r["data"] for r in results if r["seq"] == FIXED_LEN), None)
-    if not row:
-        print("roofline plot skipped (seq missing)")
-        return
-    xs, ys, labels = [], [], []
-    for c in cfgs:
-        if c in DISABLED:
-            continue
-        d = row.get(c, {})
-        if isinstance(d.get("ai"), (int, float)) and isinstance(
-            d.get("gflops"), (int, float)
-        ):
-            xs.append(d["ai"])
-            ys.append(d["gflops"])
-            labels.append(c)
+# ---------- Plot C ------------------------------------------------------------
+def plot_roofline(results, cfgs, outdir):
+    # ---- gather per-kernel series ------------------------------------------
+    series = defaultdict(lambda: ([], []))  # {kernel: ([AI], [GFLOPS])}
+    for row in results:
+        ai = row["data"][REF]["ai"]
+        for k in cfgs:
+            if k in DISABLED:
+                continue
+            d = row["data"].get(k, {})
+            if isinstance(d.get("gflops"), (int, float)):
+                series[k][0].append(ai)
+                series[k][1].append(d["gflops"])
 
-    if not xs:
-        print("roofline plot skipped (no data)")
+    if not series:
+        print("roofline skipped (no data)")
         return
 
-    plt.figure(figsize=(5, 4))
-    plt.scatter(xs, ys)
-    for i, txt in enumerate(labels):
-        plt.annotate(txt, (xs[i], ys[i]), textcoords="offset points", xytext=(4, 4))
+    # ---- plot points + tiny line so the colour is obvious -------------------
+    plt.figure(figsize=(8, 4))
+    for k, (xs, ys) in series.items():
+        order = np.argsort(xs)
+        xs, ys = np.array(xs)[order], np.array(ys)[order]
+        plt.plot(xs, ys, marker="o", label=k, linewidth=0.8)  # thin line
+
+    # ---- draw the roofs -----------------------------------------------------
+    ai_min, ai_max = (
+        0.5 * min(min(xs) for xs, _ in series.values()),
+        2 * max(max(xs) for xs, _ in series.values()),
+    )
+    ai_line = np.logspace(np.log10(ai_min), np.log10(ai_max), 256)
+    plt.plot(ai_line, PEAK_BW_GB_S * ai_line, "k--", label="Mem roof")
+    plt.axhline(PEAK_GFLOPS, color="k", linestyle=":", label="Compute roof")
+
     plt.xscale("log")
     plt.yscale("log")
-    plt.xlabel("Arithmetic intensity [FLOP / byte]")
+    plt.xlabel("Arithmetic intensity [FLOP/byte]")
     plt.ylabel("Achieved GFLOP/s")
-    plt.title(f"Roofline @ seq {FIXED_LEN}")
+    plt.title("Roofline")
+    plt.legend(bbox_to_anchor=(1.02, 0.5), loc="center left")
     plt.tight_layout()
-    plt.savefig(OUTDIR / "roofline.png")
+    plt.savefig(outdir / "C.roofline.png", dpi=200)
     plt.close()
 
 
-# ---------- Plot E  -----------------------------------------------------------
-def plot_throughput(results, cfgs):
+# ---------- Plot D ------------------------------------------------------------
+def plot_throughput(results, cfgs, outdir):
     data = collect(results, cfgs, "tok_s")
     plt.figure(figsize=(6, 4))
     for k, (x, y) in data.items():
@@ -147,30 +138,28 @@ def plot_throughput(results, cfgs):
     plt.title("Throughput vs sequence length")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(OUTDIR / "throughput.png")
+    plt.savefig(outdir / "D.throughput.png", dpi=200)
     plt.close()
 
 
-# ---------- main  -------------------------------------------------------------
+# ---------- main --------------------------------------------------------------
 def main():
-    global OUTDIR
     ap = argparse.ArgumentParser()
     ap.add_argument("json_path", help="benchmark_results.json")
-    ap.add_argument("--out", default=OUTDIR, type=Path, help="output directory")
+    ap.add_argument(
+        "--outdir", type=Path, default=OUTDIR, help="directory to write PNGs"
+    )
     args = ap.parse_args()
 
-    OUTDIR = args.out
-    OUTDIR.mkdir(parents=True, exist_ok=True)
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    results, cfgs = load_results(args.json_path)
 
-    results, cfgs = load(args.json_path)
+    plot_latency(results, cfgs, args.outdir)  # A
+    plot_memory(results, cfgs, args.outdir)  # B
+    plot_roofline(results, cfgs, args.outdir)  # C
+    plot_throughput(results, cfgs, args.outdir)  # D
 
-    plot_latency(results, cfgs)     # A
-    plot_speedup(results, cfgs)     # B
-    plot_memory(results, cfgs)      # C
-    plot_roofline(results, cfgs)    # D
-    plot_throughput(results, cfgs)  # E
-
-    print("✓ plots saved to", OUTDIR.resolve())
+    print("✓ plots saved to", args.outdir.resolve())
 
 
 if __name__ == "__main__":

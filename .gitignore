@@ -1,0 +1,3 @@
+.env
+plots/
+benchmark_results.json
